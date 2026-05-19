@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments (uv sync creates .venv/)
+.venv/
+venv/
+env/
+
+# Environment / secrets (e.g. TAPIS_TOKEN)
+.env
+.env.*
+!.env.example
+
+# marimo session cache
+__marimo__/
+.marimo/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Build / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Test / type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Jupyter (if added later)
+.ipynb_checkpoints/
