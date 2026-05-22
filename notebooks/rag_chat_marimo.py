@@ -10,7 +10,7 @@ Run in editor mode (code visible, hot-reload):
 import marimo
 
 __generated_with = "0.23.6"
-app = marimo.App(width="medium", app_title="ICICLE RAG Playground")
+app = marimo.App(width="medium", app_title="ICICLE AI Chatbook")
 
 
 @app.cell(hide_code=True)
@@ -50,7 +50,7 @@ def _imports():
 
 
 @app.cell(hide_code=True)
-def _title(Path, mo):
+def _title(CHAT_BASE_URL, EMBED_BASE_URL, Path, VECTOR_BASE_URL, mo):
     logo_path = Path(__file__).parent.parent / "assets" / "ICICLE_logo.jpg"
 
     # Header row: logo + page title, side by side. Only these two items go
@@ -59,27 +59,28 @@ def _title(Path, mo):
         header = mo.hstack(
             [
                 mo.image(src=str(logo_path), width=140),
-                mo.md("# ICICLE RAG Playground"),
+                mo.md("# ICICLE AI Chatbook"),
             ],
             justify="start",
             align="center",
             gap=2,
         )
     else:
-        header = mo.md("# ICICLE RAG Playground")
+        header = mo.md("# ICICLE AI Chatbook")
 
     # Full-width body below the header. Markdown gets to flow naturally — no hstack.
     body = mo.md(
-        """
+        f"""
         Paste a document. Ask questions. Get grounded answers.
 
-        Behind the scenes this notebook chains three Tapis services:
+        Behind the scenes this notebook chains three **ICICLE AI Services** —
+        general-purpose APIs you can build your own apps on, not just this demo:
 
-        | Step | Service | What it does |
-        | --- | --- | --- |
-        | **1. Embed** | `icicleaiembedserver` | Turns your text into 1024-dim vectors |
-        | **2. Store / retrieve** | `icicleaivecserver` | Stores vectors, finds the closest matches |
-        | **3. Chat** | `tapisagent` | Generates answers from retrieved chunks |
+        | Step | Service | What it does | Links |
+        | --- | --- | --- | --- |
+        | **1. Embed** | `icicleaiembedserver` | Qwen3 text embeddings → 1024-dim vectors | [OpenAPI docs]({EMBED_BASE_URL}/docs) |
+        | **2. Store / retrieve** | `icicleaivecserver` | Qdrant-backed vector store + retrieval | [OpenAPI docs]({VECTOR_BASE_URL}/docs) |
+        | **3. Chat** | `tapisagent` | Generates answers from the retrieved chunks | [Service]({CHAT_BASE_URL}) |
 
         All three live behind the same `X-Tapis-Token`. Get yours below 👇
         """
@@ -430,6 +431,33 @@ def _helpers(Any, EMBED_BASE_URL, VECTOR_BASE_URL, requests):
 
 
 @app.cell(hide_code=True)
+def _file_helpers():
+    import io
+
+    # Keep uploads small — this is a demo, and big PDFs mean many embed calls.
+    MAX_UPLOAD_BYTES = 2 * 1024 * 1024  # 2 MB
+
+    def extract_text_from_file(name: str, contents: bytes) -> str:
+        """Pull plain text out of an uploaded PDF / DOCX / TXT / MD file."""
+        lower = name.lower()
+        if lower.endswith(".pdf"):
+            from pypdf import PdfReader
+
+            reader = PdfReader(io.BytesIO(contents))
+            pages = [(page.extract_text() or "").strip() for page in reader.pages]
+            return "\n\n".join(p for p in pages if p)
+        if lower.endswith(".docx"):
+            import docx
+
+            document = docx.Document(io.BytesIO(contents))
+            return "\n".join(p.text for p in document.paragraphs if p.text.strip())
+        # .txt, .md, or anything else — decode as UTF-8 text.
+        return contents.decode("utf-8", errors="replace")
+
+    return MAX_UPLOAD_BYTES, extract_text_from_file
+
+
+@app.cell(hide_code=True)
 def _doc_input(mo):
     sample_text = (
         "ICICLE AI provides embedding and vector services for grounded retrieval. "
@@ -447,18 +475,28 @@ def _doc_input(mo):
         full_width=True,
         label="**📄 Document to ingest**",
     )
+    file_upload = mo.ui.file(
+        filetypes=[".pdf", ".docx", ".txt", ".md"],
+        multiple=False,
+        kind="area",
+        max_size=2 * 1024 * 1024,  # 2 MB cap, enforced client-side
+        label="…or upload a file (PDF / DOCX / TXT / MD, ≤ 2 MB). A file takes priority over the text box.",
+    )
     ingest_button = mo.ui.run_button(label="🚀 Ingest into vector store", kind="success")
 
-    mo.vstack([document_input, ingest_button])
-    return document_input, ingest_button
+    mo.vstack([document_input, file_upload, ingest_button])
+    return document_input, file_upload, ingest_button
 
 
 @app.cell(hide_code=True)
 def _ingest(
     COLLECTION,
+    MAX_UPLOAD_BYTES,
     call_embed,
     chunk_by_token_budget,
     document_input,
+    extract_text_from_file,
+    file_upload,
     ingest_button,
     max_chunk_tokens,
     mo,
@@ -485,9 +523,44 @@ def _ingest(
         mo.md("_(Click **Ingest** above to chunk → embed → store the document.)_"),
     )
 
-    text_to_ingest = document_input.value.strip()
-    if not text_to_ingest:
-        mo.stop(True, mo.callout("Paste some text first.", kind="warn"))
+    # An uploaded file takes priority over the pasted text box.
+    uploaded = file_upload.value
+    if uploaded:
+        upload = uploaded[0]
+        if len(upload.contents) > MAX_UPLOAD_BYTES:
+            mo.stop(
+                True,
+                mo.callout(
+                    f"❌ **`{upload.name}` is too large** "
+                    f"({len(upload.contents) / 1_048_576:.1f} MB). Limit is 2 MB — "
+                    "upload a smaller file or paste an excerpt instead.",
+                    kind="danger",
+                ),
+            )
+        try:
+            text_to_ingest = extract_text_from_file(upload.name, upload.contents).strip()
+        except Exception as exc:
+            mo.stop(
+                True,
+                mo.callout(
+                    f"❌ **Couldn't read `{upload.name}`:** {exc}", kind="danger"
+                ),
+            )
+        source_label = upload.name
+        if not text_to_ingest:
+            mo.stop(
+                True,
+                mo.callout(
+                    f"❌ **No extractable text in `{upload.name}`.** "
+                    "Scanned/image-only PDFs have no text layer — paste the text instead.",
+                    kind="warn",
+                ),
+            )
+    else:
+        text_to_ingest = document_input.value.strip()
+        source_label = "pasted text"
+        if not text_to_ingest:
+            mo.stop(True, mo.callout("Paste some text or upload a file first.", kind="warn"))
 
     chunks = chunk_by_token_budget(
         text_to_ingest, max_chunk_tokens.value, overlap_tokens.value
@@ -512,6 +585,7 @@ def _ingest(
                         "doc_id": doc_id,
                         "chunk_index": idx,
                         "chunk_count": len(chunks),
+                        "source": source_label,
                     },
                 )
             except Exception as exc:
@@ -530,6 +604,7 @@ def _ingest(
         ingest_summary = mo.callout(
             mo.md(
                 f"**🎉 Ingested all {len(chunks)} chunks**\n\n"
+                f"- Source: `{source_label}`\n"
                 f"- Document ID: `{doc_id}`\n"
                 f"- Collection: `{COLLECTION}`\n"
                 f"- Topic: `{topic.value or '(none)'}`"

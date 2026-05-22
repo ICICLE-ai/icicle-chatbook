@@ -6,4 +6,6 @@ requires-python = ">=3.12"
 dependencies = [
     "marimo>=0.23.6",
     "requests>=2.34.2",
+    "pypdf>=5.1.0",
+    "python-docx>=1.1.2",
 ]

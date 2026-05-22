@@ -45,3 +45,9 @@ htmlcov/
 
 # Jupyter (if added later)
 .ipynb_checkpoints/
+
+# Logs
+*.log
+
+# Local Docker overrides (Dockerfile + .dockerignore ARE committed)
+docker-compose.override.yml
