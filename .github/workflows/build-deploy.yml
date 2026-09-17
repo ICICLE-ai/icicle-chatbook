@@ -112,7 +112,7 @@ jobs:
           tags: ${{ steps.tags.outputs.image_tags }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.description=ICICLE AI Chatbook — marimo RAG notebook over the ICICLE embed, vector and LiteLLM services
+            org.opencontainers.image.description=ICICLE AI Chatbook — a hands-on RAG playground on ICICLE AI Tapis services, from embeddings and chunking to retrieval, grounded prompting and LLM-as-judge evals
             org.opencontainers.image.licenses=GPL-3.0
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ steps.tags.outputs.version_tag }}

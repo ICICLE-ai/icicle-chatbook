@@ -1,6 +1,6 @@
 # ICICLE AI Chatbook
 
-An interactive [marimo](https://marimo.io/) notebook that turns the ICICLE AI Tapis services into a hands-on RAG (retrieval-augmented generation) playground. Paste text or upload a document (**PDF**, **DOCX**, **TXT**, or **MD**, up to 2 MB), ingest it into the vector store, and chat against it — the notebook chains the embed, vector, and chat services behind a single Tapis access token. Two ways to ask, into one conversation: send a question straight away, or jot questions into a notes pad as you read and send them as a batch.
+An interactive [marimo](https://marimo.io/) notebook that turns the ICICLE AI Tapis services into a hands-on RAG (retrieval-augmented generation) playground — every step is visible, from embeddings and chunking to retrieval, grounded prompting and LLM-as-judge evaluation, so newcomers to RAG can see how each piece works. Paste text or upload a document (**PDF**, **DOCX**, **TXT**, or **MD**, up to 2 MB), ingest it into the vector store, and chat against it — the notebook chains the embed, vector, and chat services behind a single Tapis access token. Two ways to ask, into one conversation: send a question straight away, or jot questions into a notes pad as you read and send them as a batch.
 
 **Tags:** AI4CI, Software
 
