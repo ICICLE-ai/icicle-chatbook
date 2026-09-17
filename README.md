@@ -269,16 +269,16 @@ count/list/compare-everything question.
 ### Which models are actually up
 
 `GET /v1/models` lists what the proxy is *configured* with, not what answers — a listed model can be
-undeployed, out of quota, or 500ing. **🩺 Check which models are up** in ⚙️ Ingestion settings sends
-a 1-token `ping` to each listed model in parallel and marks the dropdowns:
+undeployed, out of quota, or 500ing. So as soon as your token validates, the notebook pings every
+listed model once (1 token, in parallel, on a background thread) and marks both the **Chat model**
+and **🧪 Judge model** dropdowns:
 
 - **✅ model** — answered.
-- **❌ model** — didn't. The failure reason is under *Why they failed*.
-- **model** *(no mark)* — not checked yet.
+- **❌ model** — didn't, and is sorted below the working ones.
 
-Both the **Chat model** and **🧪 Judge model** dropdowns are marked by the one check, and your
-current picks survive it. Results are a snapshot, not a subscription: re-run the check whenever you
-suspect something has changed.
+Under the dropdown, one line reports the tally with a **🔄 Re-check** button beside it. Failures are
+a backend problem, not the user's, so the reasons aren't shown. Your picks survive a re-check, and a
+model that fails its ping is never left selected.
 
 ### Reading the results
 

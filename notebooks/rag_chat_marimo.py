@@ -682,63 +682,83 @@ def _tracing_token(TAPIS_TOKEN_HOLDER, token):
 
 
 @app.cell(hide_code=True)
-def _probe_button(mo):
-    # Defined apart from the cell that reads `.value`: a click re-runs readers,
-    # never the defining cell, so the button itself survives the round trip.
-    probe_button = mo.ui.run_button(
-        label="🩺 Check which models are up",
-        tooltip="Sends a 1-token 'ping' to every listed model — a few seconds.",
+def _probe_state(mo):
+    # model id -> True (answered) / False (didn't). Written from the probe thread.
+    get_health, set_health = mo.state({})
+    get_probing, set_probing = mo.state(False)
+
+    # Remembers the picked models across the re-render new health causes. Set
+    # from the dropdowns' own cell, so no self-loop.
+    get_picks, set_picks = mo.state({})
+
+    # A counter, not a run_button: the launcher needs to tell a fresh click from
+    # a stale True, and `value` here increments once per press.
+    recheck_button = mo.ui.button(
+        value=0,
+        on_click=lambda clicks: clicks + 1,
+        label="🔄 Re-check",
+        tooltip="Ping every model again.",
     )
 
-    # Remembers the picked models across the re-render a probe (or a token
-    # revalidation) causes. Set from the dropdowns' own cell, so no self-loop.
-    get_picks, set_picks = mo.state({})
-    return get_picks, probe_button, set_picks
+    # Plain dict, not state: the launcher must not re-run when this changes, or
+    # recording a launch would immediately trigger another one.
+    PROBE_GUARD = {"signature": None}
+    return (
+        PROBE_GUARD,
+        get_health,
+        get_picks,
+        get_probing,
+        recheck_button,
+        set_health,
+        set_picks,
+        set_probing,
+    )
 
 
 @app.cell(hide_code=True)
-def _model_health(ThreadPoolExecutor, chat_models, litellm_chat, mo, probe_button, token):
-    """Liveness per model: `/v1/models` lists what's configured, not what answers.
+def _model_probe(
+    PROBE_GUARD,
+    ThreadPoolExecutor,
+    chat_models,
+    litellm_chat,
+    mo,
+    recheck_button,
+    set_health,
+    set_probing,
+    token,
+):
+    """Ping every model once, in the background, as soon as a token validates.
 
-    A model can be listed and still be undeployed, out of quota, or 500ing. The
-    cheapest honest check is the real thing: one 1-token completion each, in
-    parallel because they're all network-bound.
+    `/v1/models` lists what the proxy is *configured* with, not what answers — a
+    listed model can be undeployed, out of quota, or 500ing. The check runs on its
+    own so the dropdowns are already marked by the time anyone opens them, and in
+    a thread so a slow model never holds up the rest of the notebook.
     """
-    model_health: dict[str, str | None] = {}
-    probe_note = mo.md("")
+    _signature = (token, tuple(chat_models), recheck_button.value)
 
-    if probe_button.value and token:
-        def _probe(model: str) -> tuple[str, str | None]:
+    def _probe_all(models: list[str], tok: str) -> None:
+        def _one(model: str) -> tuple[str, bool]:
             out = litellm_chat(
-                token,
+                tok,
                 model,
                 [{"role": "user", "content": "ping"}],
                 max_tokens=1,
                 temperature=0.0,
                 timeout=25,
             )
-            return model, (str(out["error"])[:150] if out.get("error") else None)
+            return model, not out.get("error")
 
-        with mo.status.spinner(title=f"Pinging {len(chat_models)} models…"):
+        try:
             with ThreadPoolExecutor(max_workers=8) as pool:
-                model_health = dict(pool.map(_probe, chat_models))
+                set_health(dict(pool.map(_one, models)))
+        finally:
+            set_probing(False)
 
-        _down = {m: e for m, e in model_health.items() if e}
-        _up = len(model_health) - len(_down)
-        if _down:
-            probe_note = mo.md(
-                f"✅ {_up} of {len(model_health)} models answered. "
-                f"❌ didn't: "
-                + " · ".join(f"`{m}`" for m in _down)
-                + "\n\n<details><summary>Why they failed</summary>\n\n"
-                + "\n".join(f"- **{m}** — {e}" for m, e in _down.items())
-                + "\n\n</details>"
-            )
-        else:
-            probe_note = mo.md(f"✅ All {_up} listed models answered.")
-    elif probe_button.value:
-        probe_note = mo.md("_Validate a token first — the check needs one._")
-    return model_health, probe_note
+    if token and chat_models and PROBE_GUARD["signature"] != _signature:
+        PROBE_GUARD["signature"] = _signature
+        set_probing(True)
+        mo.Thread(target=_probe_all, args=(list(chat_models), token), daemon=True).start()
+    return
 
 
 @app.cell(hide_code=True)
@@ -749,11 +769,11 @@ def _config_form(
     MLFLOW_ENABLED,
     MLFLOW_TRACKING_URI,
     chat_models,
+    get_health,
     get_picks,
+    get_probing,
     mo,
-    model_health,
-    probe_button,
-    probe_note,
+    recheck_button,
     set_picks,
 ):
     topic = mo.ui.text(
@@ -772,20 +792,28 @@ def _config_form(
         (m for m in chat_models if m != _answer_default), _answer_default
     )
 
-    # ✅ / ❌ come from the last availability check; unchecked models are shown
-    # bare rather than guessed at. The label carries the mark, the value stays the
-    # plain model id, so nothing downstream has to strip anything.
-    def _label(model: str) -> str:
-        health = model_health.get(model, "unchecked")
-        if health == "unchecked":
-            return model
-        return f"❌ {model}" if health else f"✅ {model}"
+    # ✅ / ❌ come from the background availability check; until it lands models
+    # are listed bare rather than guessed at. The label carries the mark, the
+    # value stays the plain model id, so nothing downstream strips anything.
+    _health = get_health()
 
-    _options = {_label(m): m for m in chat_models}
+    def _label(model: str) -> str:
+        if model not in _health:
+            return model
+        return f"✅ {model}" if _health[model] else f"❌ {model}"
+
+    # Working models first — the ones you can actually pick.
+    _ranked = sorted(chat_models, key=lambda m: (_health.get(m, True) is False, m))
+    _options = {_label(m): m for m in _ranked}
 
     def _picked(slot: str, default: str) -> str:
         choice = get_picks().get(slot)
-        return _label(choice if choice in chat_models else default)
+        if choice not in chat_models:
+            choice = default
+        # Don't hand someone a model that just failed its ping.
+        if _health.get(choice) is False:
+            choice = next((m for m in _ranked if _health.get(m)), choice)
+        return _label(choice)
 
     chat_model = mo.ui.dropdown(
         options=_options,
@@ -810,6 +838,25 @@ def _config_form(
     overlap_tokens = mo.ui.slider(
         start=0, stop=150, step=10, value=50, label="Chunk overlap tokens"
     )
+
+    # One quiet line — which models answered, and a way to ask again. The reasons
+    # a model is down are a backend problem, not something to put in front of
+    # someone choosing from a dropdown.
+    if get_probing():
+        _health_line = mo.md("⏳ _Checking which models are available…_")
+    elif _health:
+        _up = sum(1 for ok in _health.values() if ok)
+        _health_line = mo.hstack(
+            [
+                mo.md(f"✅ **{_up} of {len(_health)} models available** (✅ / ❌ above)"),
+                recheck_button,
+            ],
+            justify="start",
+            align="center",
+            gap=1,
+        )
+    else:
+        _health_line = mo.md("")
 
     isolation_note = mo.callout(
         mo.md(
@@ -845,7 +892,7 @@ def _config_form(
                 [
                     topic,
                     mo.hstack([chat_model, top_k]),
-                    mo.hstack([probe_button, probe_note], align="center", gap=1),
+                    _health_line,
                     mo.hstack([max_chunk_tokens, overlap_tokens]),
                     isolation_note,
                 ]
@@ -859,7 +906,6 @@ def _config_form(
                         "the background and costs 4 extra model calls per answer."
                     ),
                     mo.hstack([eval_enabled, judge_model]),
-                    probe_note,
                     _mlflow_note,
                 ]
             ),
