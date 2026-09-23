@@ -48,10 +48,10 @@ def _imports():
         "gemma-4-31B-it",
     ]
 
-    # Shared Qdrant collection. The vector service already isolates rows per
-    # user via the token's subject, so a fixed collection is safe — you only
-    # ever see your own embeddings. Use `topic` (set in the config panel) to
-    # organize different documents within your private slice of the collection.
+    # A fixed name is safe for everyone: the vector service maps it to a
+    # per-user physical Qdrant collection (derived from the token's identity), so
+    # you only ever see your own embeddings. Use `topic` (set in the config
+    # panel) to organize different documents within your collection.
     COLLECTION = "icicle-demo-collection"
     return (
         Any,
@@ -832,6 +832,17 @@ def _config_form(
     )
 
     top_k = mo.ui.slider(start=1, stop=10, step=1, value=4, label="Top-K retrieval")
+    # Values are the vector service's method names; "" skips reranking.
+    rerank_method = mo.ui.dropdown(
+        options={
+            "MMR — relevant but diverse": "mmr",
+            "Cross-encoder — most accurate, slowest": "cross_encoder",
+            "Cosine rescore — exact re-sort": "cosine_rescore",
+            "Off — plain vector search": "",
+        },
+        value="MMR — relevant but diverse",
+        label="Rerank",
+    )
     max_chunk_tokens = mo.ui.slider(
         start=100, stop=600, step=50, value=300, label="Max chunk tokens"
     )
@@ -860,31 +871,23 @@ def _config_form(
 
     isolation_note = mo.callout(
         mo.md(
-            f"All ingests land in the shared Qdrant collection **`{COLLECTION}`**. "
-            "The vector service automatically isolates rows by your token's user — "
-            "you only ever retrieve your own embeddings. Use **Topic** to organize "
-            "different documents within your private slice."
+            "Name the collection to ingest into next to the **Ingest** button "
+            f"(default **`{COLLECTION}`**). Collections are private to your token — "
+            "you only ever see and retrieve your own. Use **Topic** to organize "
+            "different documents within a collection."
         ),
         kind="info",
     )
 
     if MLFLOW_ENABLED and MLFLOW_TRACKING_URI:
         _mlflow_note = mo.callout(
-            mo.md(
-                f"🧪 Judge scores log to MLflow at `{MLFLOW_TRACKING_URI}`, "
-                f"authenticated with the same `X-Tapis-Token`."
-            ),
+            mo.md("🧪 Scores are also logged to MLflow."),
             kind="info",
         )
     else:
-        _mlflow_note = mo.callout(
-            mo.md(
-                "🧪 MLflow logging is **off**. Set `MLFLOW_ENABLED=true` and "
-                "`MLFLOW_TRACKING_URI=<tapis mlflow pod>` to record scores. "
-                "Scores still show inline while it's off."
-            ),
-            kind="neutral",
-        )
+        # Nothing to say when it's off: on Tapis it's on, and a local run doesn't
+        # need setup instructions in the middle of the settings panel.
+        _mlflow_note = mo.md("")
 
     config_panel = mo.accordion(
         {
@@ -893,6 +896,7 @@ def _config_form(
                     topic,
                     mo.hstack([chat_model, top_k]),
                     _health_line,
+                    rerank_method,
                     mo.hstack([max_chunk_tokens, overlap_tokens]),
                     isolation_note,
                 ]
@@ -900,10 +904,8 @@ def _config_form(
             "🧪 Evaluation settings": mo.vstack(
                 [
                     mo.md(
-                        "One judge model scores each answer 1–5 (G-Eval) on "
-                        "faithfulness to your document, relevance to the question, "
-                        "quality of the retrieved passages, and clarity. It runs in "
-                        "the background and costs 4 extra model calls per answer."
+                        "A second model scores each answer 1–5 in the background. "
+                        "Costs 4 extra model calls per answer."
                     ),
                     mo.hstack([eval_enabled, judge_model]),
                     _mlflow_note,
@@ -918,6 +920,7 @@ def _config_form(
         judge_model,
         max_chunk_tokens,
         overlap_tokens,
+        rerank_method,
         top_k,
         topic,
     )
@@ -1054,9 +1057,88 @@ def _helpers(
             json=payload,
             timeout=120,
         )
+        if resp.status_code == 404:
+            # Collections are per user now, and one only exists once you've
+            # stored something in it — so this is "nothing ingested yet".
+            raise RuntimeError(
+                f"You have nothing in collection `{collection}` yet — ingest a document first."
+            )
         if resp.status_code != 200:
             raise RuntimeError(f"Retrieve failed [{resp.status_code}]: {resp.text[:300]}")
         return resp.json().get("results", [])
+
+    def rerank_chunks(
+        token: str,
+        query_embedding: list[float],
+        query_text: str,
+        collection: str,
+        topic: str | None,
+        top_k: int,
+        method: str,
+    ) -> list[dict]:
+        """Retrieve a wider shortlist and let the service reorder it.
+
+        Each row keeps `score` (the cosine from the vector search) and gains
+        `rerank_score`, which is what the order is based on.
+        """
+        headers = {"X-Tapis-Token": token, "Content-Type": "application/json"}
+        cookies = {"X-Tapis-Token": token}
+        payload: dict[str, Any] = {
+            "query_embedding": query_embedding,
+            "query_text": query_text,
+            "collection": collection,
+            "topic": topic or None,
+            "top_k": top_k,
+            # Enough headroom for reranking to matter, small enough that the
+            # cross-encoder (one model pass per candidate) stays quick on CPU.
+            "fetch_k": max(20, top_k * 5),
+            "method": method,
+        }
+        resp = requests.post(
+            f"{VECTOR_BASE_URL}/v1/rerank",
+            headers=headers,
+            cookies=cookies,
+            json=payload,
+            timeout=180,
+        )
+        if resp.status_code == 404:
+            raise RuntimeError(
+                f"You have nothing in collection `{collection}` yet — ingest a document first."
+            )
+        if resp.status_code == 503:
+            raise RuntimeError(
+                f"The `{method}` reranker isn't installed on the vector service. "
+                "Pick another rerank method in the settings."
+            )
+        if resp.status_code != 200:
+            raise RuntimeError(f"Rerank failed [{resp.status_code}]: {resp.text[:300]}")
+        return resp.json().get("results", [])
+
+    def list_collections(token: str) -> list[dict]:
+        """GET /v1/collections — only the caller's own collections."""
+        resp = requests.get(
+            f"{VECTOR_BASE_URL}/v1/collections",
+            headers={"X-Tapis-Token": token},
+            cookies={"X-Tapis-Token": token},
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"[{resp.status_code}] {resp.text[:200]}")
+        return resp.json().get("collections", [])
+
+    def delete_collection(token: str, collection: str) -> int:
+        """DELETE /v1/collections/{name} → number of embeddings removed."""
+        from urllib.parse import quote
+
+        resp = requests.delete(
+            f"{VECTOR_BASE_URL}/v1/collections/{quote(collection, safe='')}",
+            headers={"X-Tapis-Token": token},
+            cookies={"X-Tapis-Token": token},
+            timeout=120,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"[{resp.status_code}] {resp.text[:200]}")
+        return resp.json().get("deleted", 0)
 
     def litellm_chat(
         token: str,
@@ -1181,19 +1263,29 @@ def _helpers(
         collection: str,
         topic: str | None,
         top_k: int,
+        rerank: str | None = None,
     ) -> str:
         """Answer + provenance footer + the collapsible retrieved-chunks block."""
+
+        def _scores(r: dict) -> str:
+            cosine = f"score `{r.get('score'):.3f}`"
+            if isinstance(r.get("rerank_score"), (int, float)):
+                return f"rerank `{r['rerank_score']:.3f}`, {cosine}"
+            return cosine
+
         retrieved_summary = "\n".join(
-            f"- _Chunk {i}_ (score `{r.get('score'):.3f}`): "
+            f"- _Chunk {i}_ ({_scores(r)}): "
             f"{' '.join(r.get('chunks') or [])[:120]}…"
             for i, r in enumerate(results, start=1)
             if isinstance(r.get("score"), (int, float))
         )
         topic_suffix = f" / topic `{topic}`" if topic else ""
+        rerank_suffix = f", reranked with `{rerank}`" if rerank else ""
         return (
             f"{answer}\n\n"
             f"---\n"
-            f"_Searched collection `{collection}`{topic_suffix} — top {top_k} chunks._\n\n"
+            f"_Searched collection `{collection}`{topic_suffix} — top {top_k} chunks"
+            f"{rerank_suffix}._\n\n"
             f"<details><summary>📎 Retrieved chunks</summary>\n\n"
             f"{retrieved_summary}\n\n</details>"
         )
@@ -1217,8 +1309,12 @@ def _helpers(
         top_k: int,
         chat_model: str,
         history: list[dict] | None = None,
+        rerank: str | None = None,
     ) -> dict[str, Any]:
         """One full RAG round-trip: embed the question → retrieve → chat.
+
+        `rerank` names a vector-service rerank method ('mmr', 'cosine_rescore',
+        'cross_encoder'); None is plain top-k vector search.
 
         `history`, when given, is folded into the message array only — the query
         that gets embedded is always the bare question, so chunk selection stays
@@ -1244,6 +1340,7 @@ def _helpers(
                 top_k=top_k,
                 chat_model=chat_model,
                 history=history,
+                rerank=rerank,
                 timings=timings,
                 blank=blank,
             )
@@ -1252,6 +1349,7 @@ def _helpers(
                 {
                     "topic": topic or "",
                     "top_k": top_k,
+                    "rerank": rerank or "none",
                     "chunks_retrieved": len(out.get("results") or []),
                     **{k: round(v, 1) for k, v in out["timings"].items()},
                 }
@@ -1267,6 +1365,7 @@ def _helpers(
         top_k: int,
         chat_model: str,
         history: list[dict] | None,
+        rerank: str | None,
         timings: dict,
         blank: dict,
     ) -> dict[str, Any]:
@@ -1292,15 +1391,28 @@ def _helpers(
             # RETRIEVER, specifically: the built-in RAG judges key off the span
             # type, and its outputs must be `Document`s for them to see the chunks.
             with tracer.span(
-                "retrieve", "RETRIEVER", {"query": question, "top_k": top_k}
+                "retrieve",
+                "RETRIEVER",
+                {"query": question, "top_k": top_k, "rerank": rerank or "none"},
             ) as _sp:
-                results = retrieve_chunks(
-                    token=token,
-                    query_embedding=query_vec,
-                    collection=collection,
-                    topic=topic,
-                    top_k=top_k,
-                )
+                if rerank:
+                    results = rerank_chunks(
+                        token=token,
+                        query_embedding=query_vec,
+                        query_text=question,
+                        collection=collection,
+                        topic=topic,
+                        top_k=top_k,
+                        method=rerank,
+                    )
+                else:
+                    results = retrieve_chunks(
+                        token=token,
+                        query_embedding=query_vec,
+                        collection=collection,
+                        topic=topic,
+                        top_k=top_k,
+                    )
                 _sp.set_outputs(tracer.documents(results))
         except Exception as exc:
             return {**blank, "error": f"❌ Retrieval failed: {exc}"}
@@ -1347,8 +1459,11 @@ def _helpers(
         build_rag_messages,
         call_embed,
         chunk_by_token_budget,
+        delete_collection,
         format_answer_md,
+        list_collections,
         litellm_chat,
+        rerank_chunks,
         retrieve_chunks,
         store_chunk,
     )
@@ -1382,15 +1497,21 @@ def _file_helpers():
 
 
 @app.cell(hide_code=True)
-def _doc_input(mo):
+def _doc_input(COLLECTION, mo):
     sample_text = (
-        "ICICLE AI provides embedding and vector services for grounded retrieval. "
-        "A common pattern is to embed chunked source content, store vectors with "
-        "metadata, retrieve top matches for a user question, and send those chunks "
-        "to a chat model for constrained answering. The embedding service runs "
-        "Qwen3-Embedding via llama-cpp-python. The vector service is FastAPI on top "
-        "of Qdrant, with cosine similarity and MMR reranking. The chat service "
-        "wraps a model deployment behind a JWT-gated endpoint."
+        "Led by The Ohio State University, the U.S. National Science Foundation "
+        "funded AI institute for Intelligent Cyberinfrastructure with Computational "
+        "Learning in the Environment (ICICLE) will build the next generation of "
+        "Cyberinfrastructure to render Artificial Intelligence (AI) more accessible "
+        "to everyone and drive its further democratization in the larger society.\n\n"
+        "The widespread adoption of Artificial Intelligence (AI) fueling advances in "
+        "science, education, and commerce has been driven not only by the ability to "
+        "aggregate data from a wide range of sources, but also by the availability of "
+        "increasingly powerful Cyberinfrastructure (CI) supporting AI advances. As CI "
+        "becomes more complex and heterogeneous, end users of the technology face a "
+        "bewildering set of choices in applying AI to leverage insightful analytics, "
+        "modeling complex systems, or enabling automation.\n\n"
+        "To use services and applications, log on to: https://icicleai.tapis.io/"
     )
     document_input = mo.ui.text_area(
         value=sample_text,
@@ -1407,32 +1528,42 @@ def _doc_input(mo):
         label="…or upload a file (PDF / DOCX / TXT / MD, ≤ 2 MB). A file takes priority over the text box.",
     )
     ingest_button = mo.ui.run_button(label="🚀 Ingest into vector store", kind="success")
+    # A new name creates a new collection; an existing one adds to it.
+    ingest_collection = mo.ui.text(value=COLLECTION, label="into collection")
 
-    mo.vstack([document_input, file_upload, ingest_button])
-    return document_input, file_upload, ingest_button
+    mo.vstack(
+        [
+            document_input,
+            file_upload,
+            mo.hstack([ingest_button, ingest_collection], justify="start", align="center"),
+        ]
+    )
+    return document_input, file_upload, ingest_button, ingest_collection
 
 
 @app.cell(hide_code=True)
 def _ingest(
-    COLLECTION,
     MAX_UPLOAD_BYTES,
     call_embed,
     chunk_by_token_budget,
+    collection_slug,
     document_input,
     extract_text_from_file,
     file_upload,
     ingest_button,
+    ingest_collection,
     max_chunk_tokens,
     mo,
     overlap_tokens,
+    set_chat_target,
     store_chunk,
     token,
     topic,
     uuid,
 ):
     # This cell deliberately avoids `mo.stop`: `ingested` has to be bound on
-    # every path, because the chat and study panes below both key off it and
-    # would otherwise never render their "not ready yet" message.
+    # every path, because the collections list keys off it to re-fetch, and a
+    # stopped cell would leave it (and everything below it) un-run.
     def _resolve_source():
         """→ (text, label, error_output); exactly one of text / error is set."""
         uploaded = file_upload.value
@@ -1481,6 +1612,10 @@ def _ingest(
         ingest_summary = mo.md(
             "_(Click **Ingest** above to chunk → embed → store the document.)_"
         )
+    elif not collection_slug(ingest_collection.value):
+        ingest_summary = mo.callout(
+            "Name the collection to ingest into (letters or digits).", kind="warn"
+        )
     else:
         _text_to_ingest, _source_label, _source_error = _resolve_source()
         if _source_error is not None:
@@ -1504,7 +1639,7 @@ def _ingest(
                             token=token,
                             embedding=_vec,
                             chunk_text=_chunk,
-                            collection=COLLECTION,
+                            collection=ingest_collection.value.strip(),
                             topic=topic.value,
                             metadata={
                                 "doc_id": _doc_id,
@@ -1531,15 +1666,254 @@ def _ingest(
                         f"**🎉 Ingested all {len(_chunks)} chunks**\n\n"
                         f"- Source: `{_source_label}`\n"
                         f"- Document ID: `{_doc_id}`\n"
-                        f"- Collection: `{COLLECTION}`\n"
+                        f"- Collection: `{collection_slug(ingest_collection.value)}`\n"
                         f"- Topic: `{topic.value or '(none)'}`"
                     ),
                     kind="success",
                 )
             ingested = len(_chunks) - len(_failures)
+            if ingested:
+                # Chat with what was just ingested, scoped to its topic.
+                set_chat_target(
+                    {
+                        "collection": collection_slug(ingest_collection.value),
+                        "topic": topic.value.strip() or None,
+                    }
+                )
 
     ingest_summary
     return (ingested,)
+
+
+@app.cell(hide_code=True)
+def _collections_state(mo, re):
+    # The page state self-loops: the page-number buttons live in the same cell
+    # that reads it. The refresh counter is bumped to re-fetch the list.
+    get_coll_page, set_coll_page = mo.state(0, allow_self_loops=True)
+    get_coll_refresh, set_coll_refresh = mo.state(0)
+    get_coll_notice, set_coll_notice = mo.state(None)
+    # What the chat searches: {"collection", "topic"}, or None until you pick a
+    # saved collection or ingest one. Self-loops for the same reason as the page.
+    get_chat_target, set_chat_target = mo.state(None, allow_self_loops=True)
+    COLLECTIONS_PAGE_SIZE = 3
+
+    def collection_slug(name: str) -> str:
+        """The vector service's form of a collection name — it stores and lists
+        them slugified, so `icicle-demo-collection` comes back as
+        `icicle_demo_collection`. Compare names in this form."""
+        return re.sub(r"[^a-z0-9]+", "_", (name or "").lower()).strip("_")
+
+    return (
+        COLLECTIONS_PAGE_SIZE,
+        collection_slug,
+        get_chat_target,
+        get_coll_notice,
+        get_coll_page,
+        get_coll_refresh,
+        set_coll_notice,
+        set_chat_target,
+        set_coll_page,
+        set_coll_refresh,
+    )
+
+
+@app.cell(hide_code=True)
+def _collections_fetch(get_coll_refresh, ingested, list_collections, token):
+    # Re-runs on token validation, after every ingest, and on every refresh bump
+    # (the Refresh button, or a delete).
+    get_coll_refresh()
+    ingested  # noqa: B018 — referenced only so an ingest re-fetches the list
+    user_collections, collections_error = [], None
+    if token:
+        try:
+            user_collections = list_collections(token)
+        except Exception as exc:
+            collections_error = str(exc)
+    return collections_error, user_collections
+
+
+@app.cell(hide_code=True)
+def _collections_view(
+    COLLECTIONS_PAGE_SIZE,
+    collections_error,
+    get_coll_notice,
+    get_coll_page,
+    mo,
+    set_coll_page,
+    set_coll_refresh,
+    token,
+    user_collections,
+):
+    _total = len(user_collections)
+    _pages = max(1, -(-_total // COLLECTIONS_PAGE_SIZE))
+    # Clamp: a delete can leave you on a page that no longer exists.
+    _page = min(get_coll_page(), _pages - 1)
+    _start = _page * COLLECTIONS_PAGE_SIZE
+    _rows = [
+        {
+            "Collection": c.get("collection"),
+            "Embeddings": c.get("points", 0),
+            "Topics": ", ".join(c.get("topics") or []) or "—",
+            "Dim": c.get("vector_dim") or "—",
+        }
+        for c in user_collections[_start : _start + COLLECTIONS_PAGE_SIZE]
+    ]
+
+    # Paging is ours (numbered buttons below), so the table's own is off.
+    # Always built, so the actions cell below can read it on every path.
+    collections_table = mo.ui.table(_rows, selection="multi", pagination=False)
+    use_in_chat_button = mo.ui.run_button(
+        label="💬 Use in chat",
+        tooltip="Ask questions against the selected collection — no ingest needed.",
+    )
+    delete_collections_button = mo.ui.run_button(
+        label="🗑️ Delete selected",
+        kind="danger",
+        tooltip="Permanently deletes your embeddings in the selected collections.",
+    )
+
+    _refresh = mo.ui.button(
+        label="🔄 Refresh", on_click=lambda _: set_coll_refresh(lambda n: n + 1)
+    )
+    _page_buttons = [
+        mo.ui.button(
+            label=str(i + 1),
+            kind="success" if i == _page else "neutral",
+            on_click=lambda _, i=i: set_coll_page(i),
+        )
+        for i in range(_pages)
+    ]
+
+    _notice = get_coll_notice()
+    _heading = mo.md("### 🗂️ Your collections")
+    if not token:
+        _body = mo.md("_Validate your token above to see your collections._")
+    elif collections_error:
+        _body = mo.callout(
+            mo.md(f"❌ Couldn't list collections: {collections_error}"), kind="danger"
+        )
+    elif not _total:
+        _body = mo.hstack(
+            [mo.md("_No collections yet — ingest a document to create one._"), _refresh],
+            justify="start",
+            align="center",
+        )
+    else:
+        _body = mo.vstack(
+            [
+                collections_table,
+                mo.hstack(
+                    [
+                        mo.md(
+                            f"Showing {_start + 1}–{_start + len(_rows)} of {_total}"
+                        ),
+                        mo.hstack(_page_buttons, justify="start", gap=0.25),
+                    ],
+                    justify="space-between",
+                    align="center",
+                ),
+                mo.hstack(
+                    [use_in_chat_button, delete_collections_button, _refresh],
+                    justify="start",
+                    gap=0.5,
+                ),
+            ]
+        )
+    mo.vstack(
+        [
+            _heading,
+            _body,
+            mo.callout(mo.md(_notice[1]), kind=_notice[0]) if _notice else mo.md(""),
+        ]
+    )
+    return collections_table, delete_collections_button, use_in_chat_button
+
+
+@app.cell(hide_code=True)
+def _collections_actions(
+    collections_table,
+    delete_collection,
+    delete_collections_button,
+    mo,
+    set_chat_target,
+    set_coll_notice,
+    set_coll_refresh,
+    token,
+    use_in_chat_button,
+):
+    mo.stop(
+        not token or not (use_in_chat_button.value or delete_collections_button.value)
+    )
+    _selected = [row["Collection"] for row in collections_table.value]
+
+    if use_in_chat_button.value:
+        if len(_selected) != 1:
+            set_coll_notice(("warn", "Select exactly one collection to chat with."))
+        else:
+            set_chat_target({"collection": _selected[0], "topic": None})
+            set_coll_notice(None)
+    elif not _selected:
+        set_coll_notice(("warn", "Select at least one collection to delete."))
+    else:
+        _done, _failed = [], []
+        with mo.status.spinner(title="Deleting…"):
+            for _name in _selected:
+                try:
+                    _done.append(f"`{_name}` ({delete_collection(token, _name)} embeddings)")
+                except Exception as exc:
+                    _failed.append(f"`{_name}`: {exc}")
+        _lines = []
+        if _done:
+            _lines.append("🗑️ Deleted " + ", ".join(_done) + ".")
+        if _failed:
+            _lines.append("❌ Failed — " + "; ".join(_failed))
+        set_coll_notice(("danger" if _failed else "success", "\n\n".join(_lines)))
+        set_coll_refresh(lambda n: n + 1)
+    return
+
+
+@app.cell(hide_code=True)
+def _chat_scope(get_chat_target, mo, set_chat_target, user_collections):
+    """Which collection (and topic) the chat searches — the bridge between the
+    collections list / ingest above and the chat below."""
+    _target = get_chat_target()
+    _info = next(
+        (
+            c
+            for c in user_collections
+            if _target and c.get("collection") == _target["collection"]
+        ),
+        None,
+    )
+    # A collection that has since been deleted (or never listed) can't be chatted
+    # with, so it counts as nothing picked.
+    chat_collection = _info["collection"] if _info else None
+    _topics = list(_info.get("topics") or []) if _info else []
+    chat_topic = _target.get("topic") if _target and _target.get("topic") in _topics else None
+
+    _topic_select = mo.ui.dropdown(
+        options={"All topics": "", **{t: t for t in _topics}},
+        value=chat_topic or "All topics",
+        label="Topic",
+        on_change=lambda v: set_chat_target(lambda t: {**(t or {}), "topic": v or None}),
+    )
+    if chat_collection:
+        _scope = mo.hstack(
+            [
+                mo.md(
+                    f"💬 **Chatting with `{chat_collection}`** "
+                    f"({_info.get('points', 0)} embeddings)"
+                ),
+                _topic_select,
+            ],
+            justify="start",
+            align="center",
+            gap=1,
+        )
+    else:
+        _scope = mo.md("")
+    _scope
+    return chat_collection, chat_topic
 
 
 @app.cell(hide_code=True)
@@ -2411,9 +2785,10 @@ def _composer(mo, set_work):
 
 @app.cell(hide_code=True)
 def _study_run(
-    COLLECTION,
     answer_question,
+    chat_collection,
     chat_model,
+    chat_topic,
     eval_enabled,
     evaluate_turns,
     get_history,
@@ -2423,17 +2798,23 @@ def _study_run(
     mo,
     overlap_tokens,
     remember,
+    rerank_method,
     set_history,
     set_work,
     token,
     top_k,
-    topic,
     uuid,
 ):
     # Driven by the `work` state rather than any one button's .value — that is what
     # lets the composer, the starter chips and a confirmed batch all land here.
     work = get_work()
     mo.stop(not work, mo.md(""))
+    mo.stop(
+        not chat_collection,
+        mo.callout(
+            "Pick a saved collection or ingest a document first.", kind="warn"
+        ),
+    )
     mo.stop(
         token is None,
         mo.callout(
@@ -2461,18 +2842,21 @@ def _study_run(
         return {
             "id": str(uuid.uuid4()),  # stable handle for matching eval results back
             "question": question_text,
-            # Snapshot topic/top_k with the turn so an old answer keeps showing the
-            # settings it was actually retrieved under.
-            "topic": topic.value,
+            # Snapshot collection/topic/top_k/rerank with the turn so an old
+            # answer keeps showing the settings it was actually retrieved under.
+            "collection": chat_collection,
+            "topic": chat_topic,
             "top_k": top_k.value,
+            "rerank": rerank_method.value,
             **answer_question(
                 token,
                 question_text,
-                collection=COLLECTION,
-                topic=topic.value,
+                collection=chat_collection,
+                topic=chat_topic,
                 top_k=top_k.value,
                 chat_model=chat_model.value,
                 history=prior,
+                rerank=rerank_method.value,
             ),
         }
 
@@ -2502,10 +2886,11 @@ def _study_run(
                     "chat_model": chat_model.value,
                     "judge_model": judge_model.value,
                     "top_k": top_k.value,
+                    "rerank": rerank_method.value or "none",
                     "max_chunk_tokens": max_chunk_tokens.value,
                     "overlap_tokens": overlap_tokens.value,
-                    "topic": topic.value,
-                    "collection": COLLECTION,
+                    "topic": chat_topic or "",
+                    "collection": chat_collection,
                     "memory_enabled": remember.value,
                     "dimensions": "faithfulness,answer_relevance,context_relevance,coherence",
                 },
@@ -2583,9 +2968,10 @@ def _study_transcript(
                 + format_answer_md(
                     turn["answer"],
                     turn["results"],
-                    collection=COLLECTION,
+                    collection=turn.get("collection") or COLLECTION,
                     topic=turn.get("topic"),
                     top_k=turn.get("top_k"),
+                    rerank=turn.get("rerank"),
                 )
                 + _score_row(turn)
             ),
@@ -2645,7 +3031,7 @@ def _chat_surface(
     get_history,
     get_notes,
     GEVAL_DIMENSIONS,
-    ingested,
+    chat_collection,
     layout_mode,
     MLFLOW_ENABLED,
     mo,
@@ -2719,13 +3105,17 @@ def _chat_surface(
         chat_surface = mo.callout(
             mo.md(
                 "❌ **Cannot chat without a valid Tapis token.** "
-                "Paste a token above and re-ingest your document."
+                "Paste a token above to continue."
             ),
             kind="danger",
         )
-    elif ingested == 0:
+    elif not chat_collection:
         chat_surface = mo.callout(
-            "Ingest a document above before asking questions.", kind="neutral"
+            mo.md(
+                "**Nothing to chat with yet.** Either pick a saved collection in "
+                "**🗂️ Your collections** above (💬 Chat), or ingest a new document."
+            ),
+            kind="neutral",
         )
     else:
         # Starter chips only earn their space before the first question.
@@ -2752,6 +3142,12 @@ def _chat_surface(
                     justify="start",
                     gap=1,
                     align="center",
+                ),
+                # Nothing server-side keeps the conversation in this release.
+                mo.md(
+                    "⚠️ _Chats aren't saved. Closing this tab or letting the session "
+                    "expire loses the conversation and your notes — use "
+                    "**⬇️ Export session (.md)** to keep a copy._"
                 ),
             ],
             gap=0.5,
