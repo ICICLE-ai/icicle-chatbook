@@ -1114,17 +1114,40 @@ def _helpers(
             raise RuntimeError(f"Rerank failed [{resp.status_code}]: {resp.text[:300]}")
         return resp.json().get("results", [])
 
-    def list_collections(token: str) -> list[dict]:
-        """GET /v1/collections — only the caller's own collections."""
+    def list_collections(token: str, limit: int, offset: int) -> dict:
+        """GET /v1/collections — one page of the caller's own collections.
+
+        Returns the whole body: `collections` for this page and `total` for
+        the page count. `detail=full` is needed for `topics`, which the table
+        shows; the default `basic` listing returns it as null. Only the page
+        on screen is fetched, since `full` costs two Qdrant calls per row.
+        """
         resp = requests.get(
             f"{VECTOR_BASE_URL}/v1/collections",
+            params={"detail": "full", "limit": limit, "offset": offset},
             headers={"X-Tapis-Token": token},
             cookies={"X-Tapis-Token": token},
             timeout=60,
         )
         if resp.status_code != 200:
             raise RuntimeError(f"[{resp.status_code}] {resp.text[:200]}")
-        return resp.json().get("collections", [])
+        return resp.json()
+
+    def get_collection(token: str, collection: str) -> dict | None:
+        """GET /v1/collections/{name} → full detail, or None if it's gone."""
+        from urllib.parse import quote
+
+        resp = requests.get(
+            f"{VECTOR_BASE_URL}/v1/collections/{quote(collection, safe='')}",
+            headers={"X-Tapis-Token": token},
+            cookies={"X-Tapis-Token": token},
+            timeout=60,
+        )
+        if resp.status_code == 404:
+            return None
+        if resp.status_code != 200:
+            raise RuntimeError(f"[{resp.status_code}] {resp.text[:200]}")
+        return resp.json()
 
     def delete_collection(token: str, collection: str) -> int:
         """DELETE /v1/collections/{name} → number of embeddings removed."""
@@ -1461,6 +1484,7 @@ def _helpers(
         chunk_by_token_budget,
         delete_collection,
         format_answer_md,
+        get_collection,
         list_collections,
         litellm_chat,
         rerank_chunks,
@@ -1687,8 +1711,8 @@ def _ingest(
 
 @app.cell(hide_code=True)
 def _collections_state(mo, re):
-    # The page state self-loops: the page-number buttons live in the same cell
-    # that reads it. The refresh counter is bumped to re-fetch the list.
+    # The page state picks which page the fetch cell requests from the service.
+    # The refresh counter is bumped to re-fetch the list.
     get_coll_page, set_coll_page = mo.state(0, allow_self_loops=True)
     get_coll_refresh, set_coll_refresh = mo.state(0)
     get_coll_notice, set_coll_notice = mo.state(None)
@@ -1718,45 +1742,62 @@ def _collections_state(mo, re):
 
 
 @app.cell(hide_code=True)
-def _collections_fetch(get_coll_refresh, ingested, list_collections, token):
-    # Re-runs on token validation, after every ingest, and on every refresh bump
-    # (the Refresh button, or a delete).
+def _collections_fetch(
+    COLLECTIONS_PAGE_SIZE, get_coll_page, get_coll_refresh, ingested, list_collections, token
+):
+    # Fetches only the page on screen. Re-runs on token validation, on a page
+    # click, after every ingest, and on every refresh bump (Refresh, or a delete).
     get_coll_refresh()
     ingested  # noqa: B018 — referenced only so an ingest re-fetches the list
-    user_collections, collections_error = [], None
+    coll_page = get_coll_page()
+    user_collections, collections_total, collections_error = [], 0, None
     if token:
         try:
-            user_collections = list_collections(token)
+            _body = list_collections(
+                token, COLLECTIONS_PAGE_SIZE, coll_page * COLLECTIONS_PAGE_SIZE
+            )
+            collections_total = _body.get("total", 0)
+            _last = max(0, -(-collections_total // COLLECTIONS_PAGE_SIZE) - 1)
+            if coll_page > _last:
+                # A delete can leave you on a page that no longer exists.
+                coll_page = _last
+                _body = list_collections(
+                    token, COLLECTIONS_PAGE_SIZE, coll_page * COLLECTIONS_PAGE_SIZE
+                )
+                collections_total = _body.get("total", 0)
+            user_collections = _body.get("collections", [])
         except Exception as exc:
             collections_error = str(exc)
-    return collections_error, user_collections
+    return coll_page, collections_error, collections_total, user_collections
 
 
 @app.cell(hide_code=True)
 def _collections_view(
     COLLECTIONS_PAGE_SIZE,
+    coll_page,
     collections_error,
+    collections_total,
     get_coll_notice,
-    get_coll_page,
     mo,
     set_coll_page,
     set_coll_refresh,
     token,
     user_collections,
 ):
-    _total = len(user_collections)
+    _total = collections_total
     _pages = max(1, -(-_total // COLLECTIONS_PAGE_SIZE))
-    # Clamp: a delete can leave you on a page that no longer exists.
-    _page = min(get_coll_page(), _pages - 1)
+    _page = coll_page
     _start = _page * COLLECTIONS_PAGE_SIZE
     _rows = [
         {
             "Collection": c.get("collection"),
             "Embeddings": c.get("points", 0),
-            "Topics": ", ".join(c.get("topics") or []) or "—",
+            # The service caps topics at 100 and flags the cut with `truncated`.
+            "Topics": (", ".join(c.get("topics") or []) or "—")
+            + (" …" if c.get("truncated") else ""),
             "Dim": c.get("vector_dim") or "—",
         }
-        for c in user_collections[_start : _start + COLLECTIONS_PAGE_SIZE]
+        for c in user_collections
     ]
 
     # Paging is ours (numbered buttons below), so the table's own is off.
@@ -1873,20 +1914,24 @@ def _collections_actions(
 
 
 @app.cell(hide_code=True)
-def _chat_scope(get_chat_target, mo, set_chat_target, user_collections):
+def _chat_scope(
+    get_chat_target, get_coll_refresh, get_collection, ingested, mo, set_chat_target, token
+):
     """Which collection (and topic) the chat searches — the bridge between the
     collections list / ingest above and the chat below."""
+    # Looked up by name rather than from the table, which only holds one page.
+    # Re-runs after an ingest or delete so the counts and topics stay current.
+    get_coll_refresh()
+    ingested  # noqa: B018 — referenced only so an ingest re-fetches the target
     _target = get_chat_target()
-    _info = next(
-        (
-            c
-            for c in user_collections
-            if _target and c.get("collection") == _target["collection"]
-        ),
-        None,
-    )
-    # A collection that has since been deleted (or never listed) can't be chatted
-    # with, so it counts as nothing picked.
+    _info = None
+    if token and _target:
+        try:
+            _info = get_collection(token, _target["collection"])
+        except Exception:
+            _info = None
+    # A collection that has since been deleted (or can't be fetched) can't be
+    # chatted with, so it counts as nothing picked.
     chat_collection = _info["collection"] if _info else None
     _topics = list(_info.get("topics") or []) if _info else []
     chat_topic = _target.get("topic") if _target and _target.get("topic") in _topics else None
