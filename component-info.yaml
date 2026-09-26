@@ -1,0 +1,17 @@
+- id: "ICICLEAIChatbook:1.0.0"
+  owner: "Amit Vyas"
+  primaryThrust: "core/AI4CI"
+  name: "ICICLE AI Chatbook"
+  status: "ProductionRelease"
+  description: "An interactive marimo notebook that turns the ICICLE AI Tapis services into a hands-on RAG (retrieval-augmented generation) playground."
+  componentVersion: "1.0.0"
+  targetIcicleRelease: "2026-09"
+  hasDependentComponents:
+    - related_to: "ICICLEAIChatbook:0.1.0"
+      relationship_type: "DependsOn"
+  licenseUrl: "https://github.com/ICICLE-ai/icicle-chatbook?tab=GPL-3.0-1-ov-file"
+  publicAccess: true
+  sourceCodeUrl: "https://github.com/ICICLE-ai/icicle-chatbook"
+  codeReviewConducted: true
+  trainingTutorialsAvailable: true
+  trainingTutorialsUrl: "https://icicle-ai.github.io/training-catalog/docs/category/icicle-chatbook-2"
