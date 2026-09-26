@@ -75,7 +75,9 @@ def _imports():
 
 
 @app.cell(hide_code=True)
-def _title(EMBED_BASE_URL, LITELLM_BASE_URL, Path, VECTOR_BASE_URL, mo):
+def _title(
+    EMBED_BASE_URL, LITELLM_BASE_URL, Path, SHOW_TOKEN_INPUT, VECTOR_BASE_URL, mo
+):
     logo_path = Path(__file__).parent.parent / "assets" / "ICICLE_logo.jpg"
 
     # Header row: logo + page title, side by side. Only these two items go
@@ -93,6 +95,15 @@ def _title(EMBED_BASE_URL, LITELLM_BASE_URL, Path, VECTOR_BASE_URL, mo):
     else:
         header = mo.md("# ICICLE AI Chatbook")
 
+    # On a pod the token comes from the session cookie, so there is nothing
+    # "below" to go and get — pointing at a paste box that isn't there confuses.
+    _auth_line = (
+        "All three live behind the same `X-Tapis-Token`. Get yours below 👇"
+        if SHOW_TOKEN_INPUT
+        else "All three live behind the same `X-Tapis-Token`, taken from your "
+        "Tapis session — nothing to paste."
+    )
+
     # Full-width body below the header. Markdown gets to flow naturally — no hstack.
     body = mo.md(
         f"""
@@ -107,7 +118,7 @@ def _title(EMBED_BASE_URL, LITELLM_BASE_URL, Path, VECTOR_BASE_URL, mo):
         | **2. Store / retrieve** | `icicleaivecserver` | Qdrant-backed vector store + retrieval | [OpenAPI docs]({VECTOR_BASE_URL}/docs) |
         | **3. Chat** | `litellm` | OpenAI-compatible proxy; generates answers from the chunks | [Models]({LITELLM_BASE_URL}/v1/models) |
 
-        All three live behind the same `X-Tapis-Token`. Get yours below 👇
+        {_auth_line}
         """
     )
 
@@ -116,14 +127,22 @@ def _title(EMBED_BASE_URL, LITELLM_BASE_URL, Path, VECTOR_BASE_URL, mo):
 
 
 @app.cell(hide_code=True)
-def _token_source(mo, os):
+def _token_source(json, mo, os, time):
     """Where the Tapis token comes from — the pod already knows who you are.
 
     Served from an ICICLE AI Tapis pod, the browser holds an `X-Tapis-Token`
     cookie for `*.tapis.io` (that cookie is how you got past the login page at
-    all), and marimo hands the session's HTTP request to the kernel. So on a pod
-    we read the token from there and skip the paste box entirely; run locally
-    there is no such cookie and no request, so the UI asks for one.
+    all), and marimo hands each HTTP request to the kernel. So on a pod we read
+    the token from there and skip the paste box; run locally there is no such
+    cookie and no request, so the UI asks for one.
+
+    The cookie is re-read on every run of the status cell rather than cached
+    here: a button click carries its own request, so "Re-check" sees whatever
+    the browser holds *now*, not what it held at page load.
+
+    The pod cookie is not refreshed by signing in to the Tapis portal — that is
+    a separate login — so it can outlive its ~4 h token. When it has, we fall
+    back to the paste box instead of leaving the user stuck on a 401.
 
     `ICICLE_TOKEN_SOURCE`: `auto` (default — cookie if there is one, otherwise
     paste), `cookie` (same, but say so loudly when the cookie is missing), or
@@ -134,29 +153,71 @@ def _token_source(mo, os):
     if TOKEN_SOURCE not in ("auto", "cookie", "manual"):
         TOKEN_SOURCE = "auto"
 
-    def _from_request() -> str:
+    def token_expiry(tok: str) -> float | None:
+        """The JWT's `exp` claim (epoch seconds), or None if it can't be read.
+
+        Unverified on purpose — this only decides what to show; the services
+        do the real check.
+        """
+        import base64
+
+        try:
+            payload = tok.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            return float(json.loads(base64.urlsafe_b64decode(payload))["exp"])
+        except (IndexError, KeyError, TypeError, ValueError):
+            return None
+
+    def read_cookie_token() -> str:
+        """The freshest `X-Tapis-Token` on the current request, or ""."""
+        if TOKEN_SOURCE == "manual":
+            return ""
         # `request` is None in edit mode and in any non-served context.
         request = mo.app_meta().request
         if request is None:
             return ""
+        headers = request.headers or {}
+        candidates = []
+        # A stale cookie scoped to a parent domain can sit next to a fresh one
+        # of the same name; the parsed jar keeps only one of them, so read the
+        # raw header too and pick by expiry below.
+        for key, value in headers.items():
+            if key.lower() == "cookie":
+                for part in value.split(";"):
+                    name, _, val = part.strip().partition("=")
+                    if name.lower() == "x-tapis-token":
+                        candidates.append(val)
         # Cookie jars are case-sensitive but proxies are not consistent, and the
         # same value may arrive as a header instead — take whichever is present.
-        for source in ((request.cookies or {}), (request.headers or {})):
+        for source in ((request.cookies or {}), headers):
             for key, value in source.items():
-                if key.lower() == "x-tapis-token" and (value or "").strip():
-                    return value.strip()
-        return ""
+                if key.lower() == "x-tapis-token":
+                    candidates.append(value)
+        candidates = [c.strip().strip('"') for c in candidates if (c or "").strip()]
+        if not candidates:
+            return ""
+        return max(candidates, key=lambda c: token_expiry(c) or 0.0)
 
-    COOKIE_TOKEN = "" if TOKEN_SOURCE == "manual" else _from_request()
+    def token_expired(tok: str) -> bool:
+        exp = token_expiry(tok)
+        return exp is not None and exp <= time.time()
 
-    # With a cookie the paste box and the walkthrough are noise — the user is
-    # already signed in to Tapis, which is the only way they reached this page.
-    SHOW_TOKEN_INPUT = not COOKIE_TOKEN
-    return COOKIE_TOKEN, SHOW_TOKEN_INPUT, TOKEN_SOURCE
+    COOKIE_TOKEN = read_cookie_token()
+
+    # With a live cookie the paste box and the walkthrough are noise — the user
+    # is already signed in to Tapis. A dead one gets the paste box up front.
+    SHOW_TOKEN_INPUT = not COOKIE_TOKEN or token_expired(COOKIE_TOKEN)
+    return (
+        SHOW_TOKEN_INPUT,
+        TOKEN_SOURCE,
+        read_cookie_token,
+        token_expired,
+        token_expiry,
+    )
 
 
 @app.cell(hide_code=True)
-def _token_help(PORTAL_URL, Path, SHOW_TOKEN_INPUT, mo):
+def _token_help(PORTAL_URL, Path, mo):
     image_path = Path(__file__).parent.parent / "assets" / "access_token_ss.png"
     if image_path.exists():
         screenshot = mo.image(src=str(image_path), width=480)
@@ -169,39 +230,34 @@ def _token_help(PORTAL_URL, Path, SHOW_TOKEN_INPUT, mo):
             kind="neutral",
         )
 
-    _help = mo.accordion(
-        {
-            "🔑 How to get your Tapis access token (click to expand)": mo.vstack(
-                [
-                    mo.md(
-                        f"""
-                        1. Go to the **ICICLE AI Tapis UI** → [{PORTAL_URL}]({PORTAL_URL})
-                        2. **Log in.** You have three ways to authenticate:
-                           - Log in if you already have a TACC account
-                           - **Sign up** for a TACC account (free, takes a minute)
-                           - Log in with **CILogon** using your university account
-                        3. Once logged in, click your **username** in the bottom-left corner.
-                        4. Select **Copy Access Token**.
-                        5. Paste the JWT into the box below.
+    token_steps = mo.vstack(
+        [
+            mo.md(
+                f"""
+                1. Go to the **ICICLE AI Tapis UI** → [{PORTAL_URL}]({PORTAL_URL})
+                2. **Log in.** You have three ways to authenticate:
+                   - Log in if you already have a TACC account
+                   - **Sign up** for a TACC account (free, takes a minute)
+                   - Log in with **CILogon** using your university account
+                3. Once logged in, click your **username** in the bottom-left corner.
+                4. Select **Copy Access Token**.
+                5. Paste the JWT into the box below and click the button.
 
-                        > ⏰ Tokens expire after ~4 hours. If you start seeing `401 Token expired`,
-                        > refresh the token from the Tapis UI and paste it again.
-                        """
-                    ),
-                    screenshot,
-                ]
-            )
-        }
+                > ⏰ Tokens expire after ~4 hours. If you start seeing `401 Token expired`,
+                > refresh the token from the Tapis UI and paste it again.
+                """
+            ),
+            screenshot,
+        ]
     )
-    _help if SHOW_TOKEN_INPUT else None
-    return
+    return (token_steps,)
 
 
 @app.cell(hide_code=True)
-def _token_input(SHOW_TOKEN_INPUT, mo, os):
+def _token_input(SHOW_TOKEN_INPUT, mo, os, token_steps):
     # Both elements are always constructed — `_token_status` reads them either
-    # way — but on a pod, where the token comes from the session cookie, only the
-    # re-check button is shown.
+    # way. On a pod with a live session cookie the paste box and walkthrough are
+    # tucked into a collapsed fallback, still one click away if the cookie dies.
     token_input = mo.ui.text(
         value=os.environ.get("TAPIS_TOKEN", ""),
         placeholder="Paste your X-Tapis-Token here (eyJ...)",
@@ -214,26 +270,47 @@ def _token_input(SHOW_TOKEN_INPUT, mo, os):
         kind="info",
         tooltip="Pings the embed service /v1/model endpoint to confirm the token works.",
     )
-    mo.vstack([token_input, validate_button] if SHOW_TOKEN_INPUT else [validate_button])
+    if SHOW_TOKEN_INPUT:
+        _how = mo.accordion(
+            {"🔑 How to get your Tapis access token (click to expand)": token_steps}
+        )
+        _ui = mo.vstack([_how, token_input, validate_button])
+    else:
+        _fallback = mo.accordion(
+            {
+                "🔑 Session expired? Paste a token instead (click to expand)": mo.vstack(
+                    [token_steps, token_input]
+                )
+            }
+        )
+        _ui = mo.vstack([validate_button, _fallback])
+    _ui
     return token_input, validate_button
 
 
 @app.cell(hide_code=True)
 def _token_status(
-    COOKIE_TOKEN,
     EMBED_BASE_URL,
     FALLBACK_MODELS,
     LITELLM_BASE_URL,
     TOKEN_SOURCE,
     mo,
+    read_cookie_token,
     requests,
+    time,
+    token_expired,
+    token_expiry,
     token_input,
     validate_button,
 ):
-    # A cookie token validates on load: there is nothing for the user to paste
-    # and nothing to click, so waiting for a button press would just be a wall.
-    from_cookie = bool(COOKIE_TOKEN)
-    raw = (COOKIE_TOKEN or token_input.value).strip()
+    # A pasted token wins — the user typed it on purpose, usually because the
+    # cookie stopped working. Otherwise use the cookie on *this* request, which
+    # validates without a click: there is nothing to paste, so waiting for a
+    # button press would just be a wall.
+    pasted = token_input.value.strip()
+    cookie_now = "" if pasted else read_cookie_token()
+    from_cookie = bool(cookie_now)
+    raw = pasted or cookie_now
     token = None  # default — downstream stays locked unless we set this
     chat_models = list(FALLBACK_MODELS)
 
@@ -291,7 +368,7 @@ def _token_status(
             )
         elif raw:
             _status = mo.callout(
-                "👆 Token pasted. Click **🔐 Validate token** above to verify it before continuing.",
+                "👆 Token pasted. Click the button above to verify it before continuing.",
                 kind="neutral",
             )
         else:
@@ -305,6 +382,20 @@ def _token_status(
         _status = mo.callout(
             "❌ That doesn't look like a JWT. A Tapis access token starts with `eyJ` "
             "and has two dots. Get a fresh one from the Tapis UI and click Validate again.",
+            kind="danger",
+        )
+    elif from_cookie and token_expired(raw):
+        # No point asking the services — and "reload" won't help either: the pod
+        # cookie is its own login, and the portal sign-in doesn't refresh it.
+        _ago = max(1, int((time.time() - token_expiry(raw)) // 60))
+        _status = mo.callout(
+            mo.md(
+                f"❌ **This page's Tapis session expired {_ago} min ago.** Being "
+                "signed in at the Tapis portal doesn't refresh it — that's a separate "
+                "login. Paste a fresh token into the token box above (Tapis UI → your "
+                "username → **Copy Access Token**) and click the button, or clear "
+                "this site's cookies and reload to sign in again."
+            ),
             kind="danger",
         )
     else:
@@ -352,9 +443,10 @@ def _token_status(
             elif resp.status_code == 401:
                 _status = mo.callout(
                     (
-                        "❌ **Session expired (401).** Tapis access tokens last ~4 hours. "
-                        "Reload this page to pick up a fresh cookie, signing in again if "
-                        "Tapis asks you to."
+                        "❌ **Tapis session rejected (401).** Paste a fresh token under "
+                        "**Session expired? Paste a token instead** above (Tapis UI → "
+                        "your username → Copy Access Token), or clear this site's "
+                        "cookies and reload to sign in again."
                         if from_cookie
                         else "❌ **Token rejected (401).** Likely expired — Tapis access "
                         "tokens last ~4 hours. Get a fresh one from the Tapis UI and click "

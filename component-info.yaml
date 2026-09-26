@@ -1,10 +1,10 @@
-- id: "ICICLEAIChatbook:1.0.0"
+- id: "ICICLEAIChatbook:1.0.1"
   owner: "Amit Vyas"
   primaryThrust: "core/AI4CI"
   name: "ICICLE AI Chatbook"
   status: "ProductionRelease"
   description: "An interactive marimo notebook that turns the ICICLE AI Tapis services into a hands-on RAG (retrieval-augmented generation) playground."
-  componentVersion: "1.0.0"
+  componentVersion: "1.0.1"
   targetIcicleRelease: "2026-09"
   hasDependentComponents:
     - related_to: "ICICLEAIChatbook:0.1.0"

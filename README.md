@@ -255,8 +255,9 @@ background thread.
 ## Sign-in: pasted token or Tapis session
 
 On a Tapis pod the browser already holds an `X-Tapis-Token` cookie, and marimo passes the request to
-the kernel — so the notebook reads the token from there, validates on load, and hides the paste box
-and the token walkthrough entirely. Locally there's no cookie, so you paste one as usual.
+the kernel — so the notebook reads the token from there, validates on load, and tucks the paste box
+and the token walkthrough into a collapsed *Session expired? Paste a token instead* fallback. Locally
+there's no cookie, so you paste one as usual.
 
 | `ICICLE_TOKEN_SOURCE` | Behaviour |
 | --- | --- |
@@ -264,7 +265,10 @@ and the token walkthrough entirely. Locally there's no cookie, so you paste one 
 | `cookie` | Same, but says so when the cookie is missing |
 | `manual` | Ignore the cookie; test the paste flow on a pod |
 
-Sessions expire after ~4 hours; the notebook then asks for a page reload, which signs you in again.
+Tokens expire after ~4 hours, and the pod's cookie is **not** refreshed by being signed in at the Tapis
+portal — that's a separate login. When the cookie's token has expired, the notebook shows the paste box
+up front; paste a fresh token (or clear the site's cookies and reload to sign in again). **🔄 Re-check
+Tapis session** re-reads the cookie the browser holds at click time.
 
 ### Preload a token via environment variable
 
